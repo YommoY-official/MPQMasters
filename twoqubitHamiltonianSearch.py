@@ -65,27 +65,36 @@ def partial_transpose(rho, dims = [2,2], subsystem = 0):
 
 def lowest_eigenvalue(rho):
     eigvals = np.linalg.eigvalsh(rho)
-    x = float(np.min(eigvals).real)
+    l = np.sort(eigvals)
+    x = float(l[0])
+    y = float(l[1])
+    #x = float(np.min(eigvals).real)
 
     if np.abs(x) < 5 * 10 ** (-4):
         x = 0
-    return x
+    return x,y
 
 def plot_k( rho, epsilon, H, jump_op_list):
     k_range = np.linspace(0, 30, 100)
     k_max = 0
     flag = 0
     min_eigval_list = []
+    second_eigval_list = []
+
     #find k_max
     for k in k_range:
         output_rho = lindbladian_evolution(rho, epsilon, H, k, jump_op_list)
-        if flag == 0 and lowest_eigenvalue(output_rho) < 0:
+        lowest_eigval, second_lowest_eigval = lowest_eigenvalue(output_rho)
+        if flag == 0 and lowest_eigval < 0:
             print(lowest_eigenvalue(output_rho))
             k_max = k
             flag = 1
-        min_eigval_list.append(lowest_eigenvalue(partial_transpose(output_rho)))
+        lowest_eigval_pt , second_lowest_eigval_pt = lowest_eigenvalue(partial_transpose(output_rho))
+        min_eigval_list.append(lowest_eigval_pt)
+        second_eigval_list.append(second_lowest_eigval_pt)
 
     plt.plot(k_range, min_eigval_list,'*')
+    #plt.plot(k_range, second_eigval_list,'o')
     yrange = np.linspace(min(min_eigval_list),max(min_eigval_list),30)
     plt.plot( [k_max for __ in range(len(yrange))], yrange  , color = 'red', label = "First order DM Negative")
     plt.plot(k_range, [0 for __ in range(len(k_range))], color = 'blue')
@@ -127,10 +136,10 @@ s = 0.1
 
 # initial density matrix
 initial_rho = np.array([
+    [ 1 , 0 , 0 , 1 ],
     [ 0 , 0 , 0 , 0 ],
-    [ 0 , 1 , 1j , 0 ],
-    [ 0 , -1j , 1 , 0 ],
-    [ 0 , 0 , 0 , 0  ]
+    [ 0 , 0 , 0 , 0 ],
+    [ 1 , 0 , 0 , 1  ]
 
 ])
 
@@ -140,7 +149,7 @@ if not check_dm(initial_rho):
     print("Initial density matrix is invalid")
 
 # jump operators
-jump_op_list = [kron(sx,I2), kron(sy, I2), kron(I2,sx), kron(I2,sy)]
+jump_op_list = [kron(sx,sz), kron(sy, sz), kron(sz,sx), kron(sz,sy)]
 
 # Hamiltonian
 
