@@ -3,13 +3,13 @@ import matplotlib.pyplot as plt
 
 epsilon = 0.01
 
-v_x = 0
-v_y = 0
-v_z = 0.9
+v_x = 0.3
+v_y = 0.1
+v_z = 0.3
 
-m_x = 0
-m_y = 0
-m_z = 0.9
+m_x = 0.3
+m_y = 0.3
+m_z = 0.1
 
 k_min, k_max, k_points = 0, 50, 100
 s_min, s_max, s_points = 0, 50, 100
