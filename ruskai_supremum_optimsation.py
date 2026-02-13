@@ -163,10 +163,28 @@ def maximize(px=0.3, py=0.2, steps=4000, lr=2e-2, restarts=10, seed=0, print_eve
 
     return best_raw, best_val
 
+def optimal_value(px,py):
+    return max(abs(1-2*px),abs(1-2*py), abs(1-2*px-2*py))
 
 if __name__ == "__main__":
 
-    #add for differnte grids of px and py, and then compare with 1-2px 1-2py and 1-2px-2py
-    best_raw, best_val = maximize(px=0.1, py=0.5, steps=2000, lr=2e-2, restarts=5, seed=5)
-    print("\nBest value found:", best_val)
-    print("Best raw parameters:", best_raw.cpu().numpy())
+    #add for different grids of px and py, and then compare with 1-2px 1-2py and 1-2px-2py
+
+    #Compare for different values of px and py
+    size = 10
+    epsilon = 1e-12
+
+    best_raw_list = []
+    best_val_list = []
+
+    for px in np.linspace(epsilon, 1-epsilon, size):
+        for py in np.linspace(epsilon, 1-px, size):
+            best_raw, best_val = maximize(px,py,1000,2e-2, 1,5 )
+            best_raw_list.append(best_raw)
+            best_val_list.append(best_val)
+            print("\nBest value found:", best_val)
+            #print("Best raw parameters:", best_raw.cpu().numpy())
+
+            print(best_val - optimal_value(px,py))
+
+
