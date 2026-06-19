@@ -16,6 +16,8 @@ class ClassicalCode:
     n       : int  -- number of physical bits
     m       : int  -- number of parity checks  (= n - k)
     k       : int  -- number of logical bits
+    d       : int  -- code distance (min weight over nonzero codewords;
+                      0 if there are no nonzero codewords)
     dim     : int  -- 2**n, state-space dimension
     S       : list[tuple[int, ...]]  -- all 2**m syndrome labels
     decoder : dict[tuple[int, ...], np.ndarray[int]]
@@ -33,6 +35,7 @@ class ClassicalCode:
         self.dim:     int                    = 2 ** self.n
         self.S:       list[tuple[int, ...]]  = list(itertools.product([0, 1], repeat=self.m))
         self.decoder: dict[tuple[int, ...], np.ndarray] = self._build_decoder()
+        self.d:       int                    = self.distance()
 
     # ------------------------------------------------------------------
     # Code operations
@@ -69,6 +72,29 @@ class ClassicalCode:
             if len(table) == 2 ** self.m:
                 break
         return table
+
+    def distance(self) -> int:
+        """
+        Code distance: the minimum Hamming weight over all nonzero codewords.
+
+        A codeword is a binary vector c (length n) with zero syndrome
+        (H c = 0 mod 2).  All 2**n binary vectors are enumerated and the
+        minimum weight among the nonzero codewords is returned.
+
+        Returns
+        -------
+        int -- minimum nonzero-codeword weight, or 0 if the all-zeros
+               vector is the only codeword (k == 0).
+        """
+        zero_syn = tuple(0 for _ in range(self.m))
+        best = 0
+        for x in range(1, self.dim):
+            bits = self.to_bits(x)
+            if self.syndrome(bits) == zero_syn:
+                w = sum(bits)
+                if best == 0 or w < best:
+                    best = w
+        return best
 
     def x_string(self, bits: Sequence[int]) -> np.ndarray:
         """
