@@ -223,15 +223,76 @@ class LogicalChannel:
     # Convenience measure methods (delegate to measures.py)
     # ------------------------------------------------------------------
 
+    def stochastic_matrix(self, t: int) -> np.ndarray:
+        """
+        Classical column-stochastic matrix of the logical channel at time t.
+
+        Since the logical channel preserves diagonal (classical) states, it is
+        equivalent to a stochastic matrix with entries
+            A[i, j] = <i| Phi_t(|j><j|) |i> = p(i | j).
+        Each column is the diagonal of Phi_t applied to the basis state |j><j|,
+        so columns sum to 1 and entries are non-negative by construction.
+
+        Parameters
+        ----------
+        t : int -- time step in [0, T]
+
+        Returns
+        -------
+        np.ndarray[float], shape (2^k, 2^k) -- column-stochastic matrix A_t
+        """
+        dim_L = 2 ** self.code.k
+        A = np.zeros((dim_L, dim_L))
+        for j in range(dim_L):
+            rho_j = np.zeros((dim_L, dim_L), dtype=complex)
+            rho_j[j, j] = 1.0
+            A[:, j] = np.real(np.diag(self(t, rho_j)))
+        return A
+
+    def is_divisible(self, T: int | None = None,
+                     tol: float = 1e-9) -> tuple[bool, dict[int, bool]]:
+        """
+        Check stochastic (P-)divisibility of the logical channel over all steps.
+
+        For each step the intermediate propagator M(t) = A_t @ inv(A_{t-1}) is
+        formed from the stochastic snapshots and tested with
+        measures.is_stochastic.  A_0 = Phi_0 = I, so the check runs t = 1..T.
+        A singular A_{t-1} (non-invertible step) is reported as not divisible.
+
+        Parameters
+        ----------
+        T   : int | None -- last step to check (defaults to self.T)
+        tol : float      -- tolerance passed to is_stochastic
+
+        Returns
+        -------
+        tuple[bool, dict[int, bool]]
+            (divisible_at_all_steps, {t: M(t) is stochastic})
+        """
+        from measures import is_stochastic
+        T = self.T if T is None else T
+        per_step: dict[int, bool] = {}
+        A_prev = self.stochastic_matrix(0)   # identity at t=0
+        for t in range(1, T + 1):
+            A_t = self.stochastic_matrix(t)
+            try:
+                M = A_t @ np.linalg.inv(A_prev)
+            except np.linalg.LinAlgError:
+                per_step[t] = False           # singular step: not divisible
+            else:
+                per_step[t] = is_stochastic(M, tol)
+            A_prev = A_t
+        return all(per_step.values()), per_step
+
     def blp_measure(self, rho1: np.ndarray, rho2: np.ndarray, T: int | None = None) -> float:
         """BLP non-Markovian measure for the input pair (rho1, rho2).  See measures.blp_measure."""
         from measures import blp_measure
         return blp_measure(self, self.T if T is None else T, rho1, rho2)
 
-    def max_measure(self, T: int | None = None) -> tuple[float, tuple[int, int]]:
-        """Max BLP measure over logical basis-state pairs.  See measures.max_measure."""
-        from measures import max_measure
-        return max_measure(self.code, self, self.T if T is None else T)
+    def max_blp_measure(self, T: int | None = None) -> tuple[float, tuple[int, int]]:
+        """Max BLP measure over logical basis-state pairs.  See measures.max_blp_measure."""
+        from measures import max_blp_measure
+        return max_blp_measure(self.code, self, self.T if T is None else T)
 
     def __repr__(self) -> str:
         return (f"LogicalChannel(code={self.code!r}, T={self.T}, q={self.q}, "
