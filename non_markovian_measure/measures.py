@@ -119,6 +119,57 @@ def stochastic_distance(A: np.ndarray, axis: int = 0, tol: float = 1e-12) -> flo
     dist = float(np.linalg.norm(A - P, ord="fro"))
     return 0.0 if dist < tol else dist
 
+def l1_stochastic_distance(A: np.ndarray, axis: int = 0, tol: float = 1e-12) -> float:
+    """
+    L1 penalty distance from a square matrix A to the set of stochastic matrices.
+
+    A simple, cheap proxy for "how far A is from being stochastic": it penalises
+    every negative entry and every axis-sum that deviates from 1, with no
+    projection involved.
+
+        D(A, S) = sum_{i,j} |min(0, A_ij)|  +  sum_k |1 - (axis-sum)_k|
+
+    The first term is the total magnitude of negative entries; the second is the
+    total absolute deviation of the column (or row) sums from 1.  An
+    already-stochastic matrix gives 0.
+
+    By default ``axis=0`` (column-stochastic: every column sums to 1), matching
+    this module's ``is_stochastic`` / ``stochastic_distance`` convention.  Use
+    ``axis=1`` for row-stochastic.  The negativity term is axis-independent.
+
+    Parameters
+    ----------
+    A    : np.ndarray, shape (n, n) -- square matrix.
+    axis : int   -- 0 => columns sum to 1 (default), 1 => rows sum to 1.
+    tol  : float -- distances below this are snapped to exactly 0.0.
+
+    Returns
+    -------
+    float -- D(A, S) (>= 0), exactly 0.0 if A is already stochastic.
+
+    Raises
+    ------
+    ValueError -- if A is not a square 2-D matrix, is empty, or contains
+                  NaN/Inf entries.
+    """
+    A = np.asarray(A, dtype=float)
+    if A.ndim != 2:
+        raise ValueError(f"A must be a 2-D matrix, got ndim={A.ndim}")
+    if A.size == 0:
+        raise ValueError("A must be non-empty")
+    if A.shape[0] != A.shape[1]:
+        raise ValueError(f"A must be square, got shape {A.shape}")
+    if not np.all(np.isfinite(A)):
+        raise ValueError("A must not contain NaN or Inf values")
+    if axis not in (0, 1):
+        raise ValueError(f"axis must be 0 or 1, got {axis}")
+
+    negativity = float(np.sum(np.abs(np.minimum(A, 0.0))))
+    sum_deviation = float(np.sum(np.abs(1.0 - A.sum(axis=axis))))
+    dist = negativity + sum_deviation
+    return 0.0 if dist < tol else dist
+
+
 def blp_measure(channel: Channel, T: int, rho1: np.ndarray, rho2: np.ndarray) -> float:
     """
     BLP non-Markovian measure: sum of positive increments of the trace distance
@@ -228,5 +279,41 @@ def _test_stochastic_distance() -> None:
     print("stochastic_distance: all tests passed")
 
 
+def _test_l1_stochastic_distance() -> None:
+    # Test 1: stochastic matrices -> distance 0.
+    assert l1_stochastic_distance(np.eye(4)) == 0.0
+    S = np.array([[0.2, 0.5, 0.1],
+                  [0.3, 0.5, 0.6],
+                  [0.5, 0.0, 0.3]])
+    assert np.allclose(S.sum(axis=0), 1.0)
+    assert l1_stochastic_distance(S, axis=0) == 0.0
+    assert l1_stochastic_distance(S.T, axis=1) == 0.0
+
+    # Test 2: hand-computed value.
+    #   A = [[ 1.0, -0.5],
+    #        [ 0.0,  0.5]]
+    #   negativity   = |-0.5| = 0.5
+    #   column sums  = [1.0, 0.0] -> |1-1.0| + |1-0.0| = 0.0 + 1.0 = 1.0
+    #   total        = 1.5
+    A = np.array([[1.0, -0.5],
+                  [0.0,  0.5]])
+    assert np.isclose(l1_stochastic_distance(A, axis=0), 1.5)
+
+    # Test 3: error handling.
+    for bad, kind in [(np.ones((2, 3)), "non-square"),
+                      (np.empty((0, 0)), "empty"),
+                      (np.array([[np.nan, 0.0], [0.0, 1.0]]), "NaN"),
+                      (np.array([[np.inf, 0.0], [0.0, 1.0]]), "Inf")]:
+        try:
+            l1_stochastic_distance(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {kind} input")
+
+    print("l1_stochastic_distance: all tests passed")
+
+
 if __name__ == "__main__":
     _test_stochastic_distance()
+    _test_l1_stochastic_distance()
