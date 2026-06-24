@@ -17,7 +17,14 @@ import itertools
 import numpy as np
 
 from ClassicalCode import ClassicalCode
-from error_models import ErrorModel, SyndromeDistFn, iid_bitflip_error, make_iid_syndrome_dist
+from error_models import (
+    ErrorModel,
+    SyndromeDistFn,
+    SyndromeKernelFn,
+    SyndromeKernel2Fn,
+    iid_bitflip_error,
+    make_iid_syndrome_dist,
+)
 
 
 # ------------------------------------------------------------------
@@ -100,9 +107,18 @@ class LogicalChannel:
     code          : ClassicalCode
     T             : int                   -- maximum time step (snapshots 0..T)
     q             : float                 -- noise parameter
-    p_error       : ErrorModel            -- physical error model; default iid_bitflip_error
-    syndrome_dist : SyndromeDistFn | None -- syndrome label distribution;
-                                             defaults to make_iid_syndrome_dist(code)
+    p_error         : ErrorModel              -- physical error model; default iid_bitflip_error
+    syndrome_dist   : SyndromeDistFn | None   -- syndrome label distribution;
+                                                 defaults to make_iid_syndrome_dist(code)
+    syndrome_kernel : SyndromeKernelFn | None -- syndrome-label transition kernel
+                                                 K(e_t, e_{t-1}); when given it overrides
+                                                 syndrome_dist and builds a temporally
+                                                 correlated (non-Markovian) channel
+    syndrome_kernel2: SyndromeKernel2Fn | None -- two-step-history syndrome kernel
+                                                 K(e_t, e_{t-1}, e_{t-2}); when given it
+                                                 takes precedence over syndrome_kernel and
+                                                 syndrome_dist (e_1 seeded i.i.d. from the
+                                                 fallback once two-step history is unavailable)
 
     Attributes
     ----------
@@ -120,14 +136,18 @@ class LogicalChannel:
         q: float,
         p_error: ErrorModel = iid_bitflip_error,
         syndrome_dist: SyndromeDistFn | None = None,
+        syndrome_kernel: SyndromeKernelFn | None = None,
+        syndrome_kernel2: SyndromeKernel2Fn | None = None,
     ) -> None:
         if syndrome_dist is None:
             syndrome_dist = make_iid_syndrome_dist(code)
-        self.code:          ClassicalCode  = code
-        self.T:             int            = T
-        self.q:             float          = q
-        self.p_error:       ErrorModel     = p_error
-        self.syndrome_dist: SyndromeDistFn = syndrome_dist
+        self.code:             ClassicalCode              = code
+        self.T:                int                        = T
+        self.q:                float                      = q
+        self.p_error:          ErrorModel                 = p_error
+        self.syndrome_dist:    SyndromeDistFn             = syndrome_dist
+        self.syndrome_kernel:  SyndromeKernelFn | None    = syndrome_kernel
+        self.syndrome_kernel2: SyndromeKernel2Fn | None   = syndrome_kernel2
 
         self.U:     np.ndarray            = code.build_logical_unitary()
         self.chans: dict[int, np.ndarray] = self._build_logical_channels()
@@ -173,6 +193,12 @@ class LogicalChannel:
         First step uses Q(e1, e_in) with e_in = (0,...,0); the syndrome then
         evolves freely.  No trailing R(eT) decode is applied at any snapshot.
 
+        If a syndrome_kernel K(e_t, e_{t-1}) is supplied, the syndrome-error
+        labels form a Markov chain (initialised from e_in = 0) and the per-step
+        marginal weight psyn[e_t] is replaced by the transition probability
+        K(e_t, e_{t-1}); this is what produces a non-Markovian logical channel.
+        The i.i.d. case is recovered by K(e_t, e_{t-1}) = psyn[e_t].
+
         Returns
         -------
         dict[int, np.ndarray[complex]] -- {t: physical superoperator, shape (dim^2, dim^2)}
@@ -181,10 +207,39 @@ class LogicalChannel:
         ISUP = np.eye(code.dim ** 2, dtype=complex)
         e_in = tuple(0 for _ in range(code.m))
         S    = code.S
-        psyn = self.syndrome_dist(self.q)
         SQ   = self._build_SQ()
 
         chans: dict[int, np.ndarray] = {0: ISUP.copy()}
+        if self.syndrome_kernel2 is not None:
+            K2 = self.syndrome_kernel2
+            # State carried as the pair (last label, previous label).  e_0 = 0 and a
+            # virtual e_{-1} = 0 seed e_1 via the kernel's i.i.d. fallback branch
+            # (0 XOR 0 != all-ones), so two-step history only acts from t = 2 on.
+            C2 = {(e1, e_in): K2(e1, e_in, e_in) * SQ[e1][e_in] for e1 in S}
+            chans[1] = sum(C2.values())
+            for t in range(2, self.T + 1):
+                C2 = {
+                    (e_t, e_tm1): sum(
+                        K2(e_t, e_tm1, e_tm2) * SQ[e_t][e_tm1] @ C2[(e_tm1, e_tm2)]
+                        for e_tm2 in S if (e_tm1, e_tm2) in C2
+                    )
+                    for e_t in S for e_tm1 in S
+                }
+                chans[t] = sum(C2.values())
+            return chans
+
+        if self.syndrome_kernel is not None:
+            K = self.syndrome_kernel
+            # first step: e_1 ~ K(.|e_in=0), conditioning the chain on e_in
+            C        = {e1: K(e1, e_in) * SQ[e1][e_in] for e1 in S}
+            chans[1] = sum(C[e1] for e1 in S)                  # no trailing R(e1)
+            for t in range(2, self.T + 1):
+                C        = {ei: sum(K(ei, eim1) * SQ[ei][eim1] @ C[eim1] for eim1 in S)
+                            for ei in S}
+                chans[t] = sum(C[et] for et in S)              # no trailing R(eT)
+            return chans
+
+        psyn     = self.syndrome_dist(self.q)
         C        = {e1: psyn[e1] * SQ[e1][e_in] for e1 in S}   # first step: Q(e1, e_in=0)
         chans[1] = sum(C[e1] for e1 in S)                      # no trailing R(e1)
         for t in range(2, self.T + 1):

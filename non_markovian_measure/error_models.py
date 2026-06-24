@@ -8,6 +8,12 @@ An ErrorModel is any callable  f(e, p) -> float  where:
 
 A SyndromeDistFn is a callable  f(p) -> dict[tuple[int,...], float]  returning
 a full distribution over code.S for a given noise parameter p.
+
+A SyndromeKernelFn is a callable  K(e_t, e_{t-1}) -> float  giving the transition
+probability of syndrome-error label e_t given the previous label e_{t-1}.  Unlike
+a SyndromeDistFn (a per-step marginal applied independently), a kernel carries
+temporal correlation, which is what makes the resulting logical channel
+non-Markovian.
 """
 
 from typing import Callable, Sequence, TYPE_CHECKING
@@ -15,8 +21,12 @@ from typing import Callable, Sequence, TYPE_CHECKING
 if TYPE_CHECKING:                       # avoid a runtime import cycle
     from ClassicalCode import ClassicalCode
 
-ErrorModel     = Callable[[Sequence[int], float], float]
-SyndromeDistFn = Callable[[float], dict[tuple[int, ...], float]]
+ErrorModel        = Callable[[Sequence[int], float], float]
+SyndromeDistFn    = Callable[[float], dict[tuple[int, ...], float]]
+SyndromeKernelFn  = Callable[[tuple[int, ...], tuple[int, ...]], float]
+SyndromeKernel2Fn = Callable[[tuple[int, ...], tuple[int, ...], tuple[int, ...]], float]
+
+
 
 
 # ------------------------------------------------------------------
@@ -39,6 +49,24 @@ def iid_bitflip_error(e: Sequence[int], p: float) -> float:
     w = int(sum(e))
     n = len(e)
     return p ** w * (1 - p) ** (n - w)
+
+
+def perfect_physical_error(e: Sequence[int], p: float) -> float:
+    """
+    Noiseless physical channel: probability 1 on the all-zeros pattern, 0 else.
+
+    Independent of p, so it can be slotted in wherever an ErrorModel is expected.
+
+    Parameters
+    ----------
+    e : Sequence[int] -- binary error pattern
+    p : float         -- ignored
+
+    Returns
+    -------
+    float -- 1.0 if e is all zeros, else 0.0
+    """
+    return 1.0 if int(sum(e)) == 0 else 0.0
 
 
 def single_error_model(e: Sequence[int], p: float) -> float:
@@ -159,3 +187,85 @@ def make_single_flip_syndrome_dist(code: 'ClassicalCode') -> SyndromeDistFn:
         return result
     dist.__name__ = 'single_flip_syndrome'
     return dist
+
+
+# ------------------------------------------------------------------
+# Syndrome-label transition kernels  (temporally correlated => non-Markovian)
+# ------------------------------------------------------------------
+
+def make_non_markovian_syndrome_kernel(code: 'ClassicalCode',
+                                       q: float, p: float) -> SyndromeKernelFn:
+    """
+    Factory: non-Markovian (temporally correlated) syndrome-error kernel.
+
+    At each step the syndrome error e_t repeats the previous one e_{t-1} with
+    probability q; otherwise (prob 1 - q) it is freshly drawn from the i.i.d.
+    bit-flip distribution with parameter p:
+
+        K(e_t | e_{t-1}) = q * [e_t == e_{t-1}] + (1 - q) * iid_bitflip(e_t, p)
+
+    For each fixed e_{t-1} this is a valid distribution over code.S (the
+    iid_bitflip masses sum to 1 and the delta term contributes q), so columns
+    are normalised.  The repeat term q correlates consecutive labels in time,
+    which is what renders the induced logical channel non-Markovian.
+
+    Parameters
+    ----------
+    code : ClassicalCode
+    q    : float -- probability of repeating the previous syndrome error
+    p    : float -- bit-flip parameter of the fresh-draw distribution
+
+    Returns
+    -------
+    SyndromeKernelFn -- callable  K(e_t, e_{t-1}) -> float
+    """
+    iid = {e: iid_bitflip_error(e, p) for e in code.S}
+
+    def kernel(e_t: tuple[int, ...], e_tm1: tuple[int, ...]) -> float:
+        same = 1.0 if e_t == e_tm1 else 0.0
+        return q * same + (1.0 - q) * iid[e_t]
+    kernel.__name__ = 'non_markovian_syndrome'
+    return kernel
+
+
+def make_exp_error_model_1(code: 'ClassicalCode',
+                           q: float, p: float) -> SyndromeKernel2Fn:
+    """
+    Factory: experimental two-step-history syndrome kernel (arbitrary, for probing
+    non-Markovian behaviour).
+
+    For t >= 2 the transition depends on the two previous syndrome errors.  If
+    their mod-2 sum (XOR) is the all-ones string, the next error is forced toward
+    all-ones; otherwise it is i.i.d. bit-flip(p):
+
+        if (e_{t-1} XOR e_{t-2}) == 11...1:
+            K(e_t | e_{t-1}, e_{t-2}) = q * [e_t == 11...1] + (1 - q) * iid_bitflip(e_t, p)
+        else:
+            K(e_t | e_{t-1}, e_{t-2}) = iid_bitflip(e_t, p)
+
+    Each branch is normalised over e_t (the iid masses sum to 1 and the delta term
+    contributes q).  With q = 1 the all-ones history pins e_t to all-ones.
+
+    Parameters
+    ----------
+    code : ClassicalCode
+    q    : float -- probability of forcing all-ones when the history condition fires
+    p    : float -- bit-flip parameter of the i.i.d. fallback distribution
+
+    Returns
+    -------
+    SyndromeKernel2Fn -- callable  K(e_t, e_{t-1}, e_{t-2}) -> float
+    """
+    allones = tuple(1 for _ in range(code.m))
+    iid     = {e: iid_bitflip_error(e, p) for e in code.S}
+
+    def kernel2(e_t: tuple[int, ...],
+                e_tm1: tuple[int, ...],
+                e_tm2: tuple[int, ...]) -> float:
+        xor = tuple(a ^ b for a, b in zip(e_tm1, e_tm2))
+        if xor == allones:
+            same = 1.0 if e_t == allones else 0.0
+            return q * same + (1.0 - q) * iid[e_t]
+        return iid[e_t]
+    kernel2.__name__ = 'exp_error_model_1'
+    return kernel2
