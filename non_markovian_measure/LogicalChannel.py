@@ -19,11 +19,9 @@ import numpy as np
 from ClassicalCode import ClassicalCode
 from error_models import (
     ErrorModel,
-    SyndromeDistFn,
-    SyndromeKernelFn,
-    SyndromeKernel2Fn,
+    SyndromeProcess,
     iid_bitflip_error,
-    make_iid_syndrome_dist,
+    iid_syndrome,
 )
 
 
@@ -106,19 +104,15 @@ class LogicalChannel:
     ----------
     code          : ClassicalCode
     T             : int                   -- maximum time step (snapshots 0..T)
-    q             : float                 -- noise parameter
-    p_error         : ErrorModel              -- physical error model; default iid_bitflip_error
-    syndrome_dist   : SyndromeDistFn | None   -- syndrome label distribution;
-                                                 defaults to make_iid_syndrome_dist(code)
-    syndrome_kernel : SyndromeKernelFn | None -- syndrome-label transition kernel
-                                                 K(e_t, e_{t-1}); when given it overrides
-                                                 syndrome_dist and builds a temporally
-                                                 correlated (non-Markovian) channel
-    syndrome_kernel2: SyndromeKernel2Fn | None -- two-step-history syndrome kernel
-                                                 K(e_t, e_{t-1}, e_{t-2}); when given it
-                                                 takes precedence over syndrome_kernel and
-                                                 syndrome_dist (e_1 seeded i.i.d. from the
-                                                 fallback once two-step history is unavailable)
+    q             : float                 -- physical noise parameter (passed to p_error)
+    p_error       : ErrorModel            -- physical (data-qubit) error model;
+                                             default iid_bitflip_error
+    syndrome      : SyndromeProcess | None -- syndrome-readout error process; defaults
+                                             to iid_syndrome(code, q).  Its `memory`
+                                             attribute sets how many previous syndrome
+                                             labels each step conditions on (0 = i.i.d.
+                                             Markovian, >= 1 = temporally correlated /
+                                             non-Markovian)
 
     Attributes
     ----------
@@ -135,28 +129,68 @@ class LogicalChannel:
         T: int,
         q: float,
         p_error: ErrorModel = iid_bitflip_error,
-        syndrome_dist: SyndromeDistFn | None = None,
-        syndrome_kernel: SyndromeKernelFn | None = None,
-        syndrome_kernel2: SyndromeKernel2Fn | None = None,
+        syndrome: SyndromeProcess | None = None,
+        classical: bool = True,
     ) -> None:
-        if syndrome_dist is None:
-            syndrome_dist = make_iid_syndrome_dist(code)
-        self.code:             ClassicalCode              = code
-        self.T:                int                        = T
-        self.q:                float                      = q
-        self.p_error:          ErrorModel                 = p_error
-        self.syndrome_dist:    SyndromeDistFn             = syndrome_dist
-        self.syndrome_kernel:  SyndromeKernelFn | None    = syndrome_kernel
-        self.syndrome_kernel2: SyndromeKernel2Fn | None   = syndrome_kernel2
+        if syndrome is None:
+            syndrome = iid_syndrome(code, q)
+        self.code:      ClassicalCode   = code
+        self.T:         int             = T
+        self.q:         float           = q
+        self.p_error:   ErrorModel      = p_error
+        self.syndrome:  SyndromeProcess = syndrome
+        self.classical: bool            = classical
 
-        self.U:     np.ndarray            = code.build_logical_unitary()
-        self.chans: dict[int, np.ndarray] = self._build_logical_channels()
+        self.U:     np.ndarray = code.build_logical_unitary()
+        self._prepare_logical_labels()   # self._codespace, self._log_label
 
-        # cached pieces for the logical-space wrapper
+        # cached pieces for the (superoperator) logical-space wrapper
         dim_S          = 2 ** code.m
         e_in_idx       = code.S.index(tuple(0 for _ in range(code.m)))
         self._zero_syn = np.zeros((dim_S, dim_S))
         self._zero_syn[e_in_idx, e_in_idx] = 1.0
+
+        # classical (diagonal) fast path builds cheap 2^n x 2^n stochastic snapshots;
+        # the full complex 2^(2n) x 2^(2n) superoperators are built only when needed
+        # (classical=False), e.g. for coherent inputs / genuine quantum codes.
+        if classical:
+            self.chans:  dict[int, np.ndarray] | None = None
+            self.cchans: dict[int, np.ndarray] | None = self._build_classical_channels()
+        else:
+            self.chans  = self._build_logical_channels()
+            self.cchans = None
+
+    def _prepare_logical_labels(self) -> None:
+        """
+        Precompute, for the classical fast path:
+          self._codespace : np.ndarray[int], shape (2^k,)  -- physical index of each
+                            logical basis state (the sorted zero-syndrome codewords)
+          self._log_label : np.ndarray[int], shape (2^n,)  -- logical label l(x) of
+                            every physical basis index x (decode syndrome, correct,
+                            look up codeword position).  Mirrors build_logical_unitary
+                            without building the (dim, dim) permutation matrix.
+        """
+        code = self.code
+        n = code.n
+        zero_syn  = tuple(0 for _ in range(code.m))
+        codespace = sorted(y for y in range(code.dim)
+                           if code.syndrome(code.to_bits(y)) == zero_syn)
+        log_idx   = {y: l for l, y in enumerate(codespace)}
+
+        def frombits(bits) -> int:                    # inverse of code.to_bits (MSB first)
+            v = 0
+            for i, b in enumerate(bits):
+                v |= int(b) << (n - 1 - i)
+            return v
+
+        self._frombits = frombits
+        self._codespace = np.array(codespace, dtype=int)
+        log_label = np.empty(code.dim, dtype=int)
+        for x in range(code.dim):
+            s = code.syndrome(code.to_bits(x))
+            y = x ^ frombits(code.decoder[s])         # apply recovery R(s) = X^{decoder[s]}
+            log_label[x] = log_idx[y]
+        self._log_label = log_label
 
     # ------------------------------------------------------------------
     # Channel construction
@@ -190,14 +224,17 @@ class LogicalChannel:
         """
         Build physical-space superoperator snapshots Lambda_t, t = 0..T.
 
-        First step uses Q(e1, e_in) with e_in = (0,...,0); the syndrome then
-        evolves freely.  No trailing R(eT) decode is applied at any snapshot.
+        The syndrome-error labels form a process (self.syndrome) that conditions
+        each new label on the previous ``memory`` labels; the per-step transfer
+        superoperator SQ[e_t][e_{t-1}] is weighted by prob(e_t | history).  A
+        single loop handles any memory: the running dict C is keyed by the last
+        ``L = max(1, memory)`` labels (most-recent first) -- one label is always
+        needed because SQ couples e_t to e_{t-1}, the rest carry the process
+        history.  Labels before t = 1 are the zero label (e_0 = e_{-1} = ... = 0).
 
-        If a syndrome_kernel K(e_t, e_{t-1}) is supplied, the syndrome-error
-        labels form a Markov chain (initialised from e_in = 0) and the per-step
-        marginal weight psyn[e_t] is replaced by the transition probability
-        K(e_t, e_{t-1}); this is what produces a non-Markovian logical channel.
-        The i.i.d. case is recovered by K(e_t, e_{t-1}) = psyn[e_t].
+        memory = 0 reproduces the i.i.d. (Markovian) channel; memory >= 1 gives a
+        temporally correlated (non-Markovian) one.  No trailing R(eT) decode is
+        applied at any snapshot.
 
         Returns
         -------
@@ -205,55 +242,171 @@ class LogicalChannel:
         """
         code = self.code
         ISUP = np.eye(code.dim ** 2, dtype=complex)
-        e_in = tuple(0 for _ in range(code.m))
+        zero = tuple(0 for _ in range(code.m))
         S    = code.S
         SQ   = self._build_SQ()
 
+        syn    = self.syndrome
+        memory = syn.memory
+        L      = max(1, memory)                 # labels carried in the running state
+        pad    = (zero,) * (L - 1)              # older labels, all zero at t = 1
+
         chans: dict[int, np.ndarray] = {0: ISUP.copy()}
-        if self.syndrome_kernel2 is not None:
-            K2 = self.syndrome_kernel2
-            # State carried as the pair (last label, previous label).  e_0 = 0 and a
-            # virtual e_{-1} = 0 seed e_1 via the kernel's i.i.d. fallback branch
-            # (0 XOR 0 != all-ones), so two-step history only acts from t = 2 on.
-            C2 = {(e1, e_in): K2(e1, e_in, e_in) * SQ[e1][e_in] for e1 in S}
-            chans[1] = sum(C2.values())
-            for t in range(2, self.T + 1):
-                C2 = {
-                    (e_t, e_tm1): sum(
-                        K2(e_t, e_tm1, e_tm2) * SQ[e_t][e_tm1] @ C2[(e_tm1, e_tm2)]
-                        for e_tm2 in S if (e_tm1, e_tm2) in C2
-                    )
-                    for e_t in S for e_tm1 in S
-                }
-                chans[t] = sum(C2.values())
-            return chans
 
-        if self.syndrome_kernel is not None:
-            K = self.syndrome_kernel
-            # first step: e_1 ~ K(.|e_in=0), conditioning the chain on e_in
-            C        = {e1: K(e1, e_in) * SQ[e1][e_in] for e1 in S}
-            chans[1] = sum(C[e1] for e1 in S)                  # no trailing R(e1)
-            for t in range(2, self.T + 1):
-                C        = {ei: sum(K(ei, eim1) * SQ[ei][eim1] @ C[eim1] for eim1 in S)
-                            for ei in S}
-                chans[t] = sum(C[et] for et in S)              # no trailing R(eT)
-            return chans
+        # t = 1: previous labels e_0 = ... = e_{1-memory} = zero.
+        hist0 = (zero,) * memory
+        C: dict[tuple, np.ndarray] = {}
+        for e1 in S:
+            w = syn.prob(e1, hist0)
+            if w == 0.0:
+                continue
+            C[(e1,) + pad] = w * SQ[e1][zero]   # state = (e1, 0, ..., 0)
+        chans[1] = sum(C.values()) if C else np.zeros_like(ISUP)
 
-        psyn     = self.syndrome_dist(self.q)
-        C        = {e1: psyn[e1] * SQ[e1][e_in] for e1 in S}   # first step: Q(e1, e_in=0)
-        chans[1] = sum(C[e1] for e1 in S)                      # no trailing R(e1)
         for t in range(2, self.T + 1):
-            C        = {ei: psyn[ei] * sum(SQ[ei][eim1] @ C[eim1] for eim1 in S) for ei in S}
-            chans[t] = sum(C[et] for et in S)                  # no trailing R(eT)
+            C_next: dict[tuple, np.ndarray] = {}
+            for state, mat in C.items():
+                e_prev  = state[0]              # e_{t-1}, the previous SQ label
+                history = state[:memory]        # last `memory` labels, most-recent first
+                for e_t in S:
+                    w = syn.prob(e_t, history)
+                    if w == 0.0:
+                        continue
+                    new_state = (e_t,) + state[:-1]        # drop oldest label
+                    contrib   = w * (SQ[e_t][e_prev] @ mat)
+                    if new_state in C_next:
+                        C_next[new_state] += contrib
+                    else:
+                        C_next[new_state] = contrib
+            C = C_next
+            chans[t] = sum(C.values()) if C else np.zeros_like(ISUP)
         return chans
+
+    # ------------------------------------------------------------------
+    # Classical (diagonal-only) fast path
+    #
+    # Every error/recovery operator is a bit-flip permutation, so on the
+    # computational basis it just maps population at index x to (x XOR shift).
+    # The whole superoperator machinery collapses to real 2^n x 2^n stochastic
+    # matrices -- exact for classical codes, cheap enough to reach large n.
+    # ------------------------------------------------------------------
+
+    def _build_SQ_classical(self) -> dict[tuple[int, ...], np.ndarray]:
+        """
+        Classical one-step transfer matrices, keyed by the syndrome-label
+        *difference* d = e_i XOR e_{i-1}.
+
+        The dense SQ[e_i][e_{i-1}] depends on the pair only through d (because
+        s = syndrome(e~) XOR e_i XOR e_{i-1} = syndrome(e~) XOR d), so there are
+        only 2^m distinct matrices, each
+
+            SQ_cl[d][y, x] = sum_{e~ : x XOR m(e~) XOR m(decoder[s]) == y} p_error(e~, q),
+            s = syndrome(e~) XOR d.
+
+        Returns
+        -------
+        dict[tuple[int,...], np.ndarray[float]] -- {d: (dim, dim) column-stochastic}
+        """
+        code      = self.code
+        dim       = code.dim
+        frombits  = self._frombits
+        xall      = np.arange(dim)
+
+        # per physical error e~: (shift m(e~), syndrome, probability) -- skip zero-prob
+        errs = []
+        for e in itertools.product([0, 1], repeat=code.n):
+            p_e = self.p_error(e, self.q)
+            if p_e == 0.0:
+                continue
+            errs.append((frombits(e), code.syndrome(e), p_e))
+
+        SQ_cl: dict[tuple[int, ...], np.ndarray] = {}
+        for d in code.S:
+            M = np.zeros((dim, dim))
+            for me, syn_e, p_e in errs:
+                s   = tuple(a ^ b for a, b in zip(syn_e, d))
+                sh  = me ^ frombits(code.decoder[s])
+                # population at column x moves to row (x XOR sh)
+                np.add.at(M, (xall ^ sh, xall), p_e)
+            SQ_cl[d] = M
+        return SQ_cl
+
+    def _build_classical_channels(self) -> dict[int, np.ndarray]:
+        """
+        Classical analogue of _build_logical_channels: real (dim, dim) stochastic
+        population-transfer snapshots Lambda_t on the physical computational basis.
+        Identical memory-keyed loop, with SQ_cl[e_t XOR e_prev] replacing the dense
+        SQ[e_t][e_prev] and a real identity as the t=0 snapshot.
+        """
+        code  = self.code
+        dim   = code.dim
+        I     = np.eye(dim)
+        zero  = tuple(0 for _ in range(code.m))
+        S     = code.S
+        SQ_cl = self._build_SQ_classical()
+
+        syn    = self.syndrome
+        memory = syn.memory
+        L      = max(1, memory)
+        pad    = (zero,) * (L - 1)
+
+        def xor(a: tuple, b: tuple) -> tuple:
+            return tuple(x ^ y for x, y in zip(a, b))
+
+        chans: dict[int, np.ndarray] = {0: I.copy()}
+
+        hist0 = (zero,) * memory
+        C: dict[tuple, np.ndarray] = {}
+        for e1 in S:
+            w = syn.prob(e1, hist0)
+            if w == 0.0:
+                continue
+            C[(e1,) + pad] = w * SQ_cl[xor(e1, zero)]      # xor(e1, 0) = e1
+        chans[1] = sum(C.values()) if C else np.zeros((dim, dim))
+
+        for t in range(2, self.T + 1):
+            C_next: dict[tuple, np.ndarray] = {}
+            for state, mat in C.items():
+                e_prev  = state[0]
+                history = state[:memory]
+                for e_t in S:
+                    w = syn.prob(e_t, history)
+                    if w == 0.0:
+                        continue
+                    new_state = (e_t,) + state[:-1]
+                    contrib   = w * (SQ_cl[xor(e_t, e_prev)] @ mat)
+                    if new_state in C_next:
+                        C_next[new_state] += contrib
+                    else:
+                        C_next[new_state] = contrib
+            C = C_next
+            chans[t] = sum(C.values()) if C else np.zeros((dim, dim))
+        return chans
+
+    def _logical_stochastic(self, C: np.ndarray) -> np.ndarray:
+        """
+        Reduce a physical population-transfer matrix C (dim, dim) to the logical
+        column-stochastic matrix A (2^k, 2^k):
+            A[i, j] = sum_{x : l(x) == i}  C[x, codespace[j]].
+        Columns are aggregated by logical label; the codespace columns pick the
+        zero-syndrome logical inputs.
+        """
+        dim_L = 2 ** self.code.k
+        Cj    = C[:, self._codespace]              # (dim, 2^k): logical inputs
+        A     = np.zeros((dim_L, dim_L))
+        np.add.at(A, self._log_label, Cj)          # sum rows grouped by logical label
+        return A
 
     # ------------------------------------------------------------------
     # Application
     # ------------------------------------------------------------------
 
     def snapshot(self, t: int) -> np.ndarray:
-        """Raw physical superoperator Lambda_t, shape (dim^2, dim^2)."""
-        return self.chans[t]
+        """
+        Raw physical snapshot Lambda_t.  Superoperator (dim^2, dim^2) when
+        classical=False, else the classical population-transfer matrix (dim, dim).
+        """
+        return self.cchans[t] if self.classical else self.chans[t]
 
     def __call__(self, t: int, rho_L: np.ndarray) -> np.ndarray:
         """
@@ -267,7 +420,23 @@ class LogicalChannel:
         Returns
         -------
         np.ndarray[complex], shape (2^k, 2^k) -- logical output density matrix
+
+        Notes
+        -----
+        In the classical (default) mode only *diagonal* logical inputs are
+        supported -- the dynamics preserve diagonals, so the output is
+        diag(A_t @ diag(rho_L)).  Pass ``classical=False`` at construction to
+        apply the channel to coherent (non-diagonal) states.
         """
+        if self.classical:
+            diag = np.diag(rho_L)
+            if not np.allclose(rho_L, np.diag(diag), atol=1e-12):
+                raise ValueError(
+                    "classical=True LogicalChannel supports only diagonal logical "
+                    "inputs; construct with classical=False for coherent states.")
+            out = self.stochastic_matrix(t) @ np.real(diag)
+            return np.diag(out).astype(complex)
+
         code       = self.code
         rho_phys   = self.U.T.conj() @ np.kron(rho_L, self._zero_syn) @ self.U
         sigma_phys = unvec(self.chans[t] @ vec(rho_phys), code.dim)
@@ -296,7 +465,10 @@ class LogicalChannel:
         -------
         np.ndarray[float], shape (2^k, 2^k) -- column-stochastic matrix A_t
         """
-        dim_L = 2 ** self.code.k
+        if self.classical:                       # cheap: aggregate the classical snapshot
+            return self._logical_stochastic(self.cchans[t])
+
+        dim_L = 2 ** self.code.k                  # superoperator route (classical=False)
         A = np.zeros((dim_L, dim_L))
         for j in range(dim_L):
             rho_j = np.zeros((dim_L, dim_L), dtype=complex)

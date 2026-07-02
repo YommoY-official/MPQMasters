@@ -1,30 +1,36 @@
 """
 Error models for the QEC non-Markovianity study.
 
-An ErrorModel is any callable  f(e, p) -> float  where:
-  e : Sequence[int]  -- binary pattern (length n for physical, length m for syndrome)
-  p : float          -- noise parameter in [0, 1]
-  return : float     -- probability of that pattern
+There are two, physically distinct, noise sources -- both described by the *same*
+simple interface "return the probability of a bitstring":
 
-A SyndromeDistFn is a callable  f(p) -> dict[tuple[int,...], float]  returning
-a full distribution over code.S for a given noise parameter p.
+1. Physical (data-qubit) errors.  An ``ErrorModel`` is any callable
+       f(e, p) -> float
+   giving the probability of the length-n error pattern ``e`` at noise rate ``p``.
+   This corrupts the state; the true syndrome is ``H @ e``.
 
-A SyndromeKernelFn is a callable  K(e_t, e_{t-1}) -> float  giving the transition
-probability of syndrome-error label e_t given the previous label e_{t-1}.  Unlike
-a SyndromeDistFn (a per-step marginal applied independently), a kernel carries
-temporal correlation, which is what makes the resulting logical channel
-non-Markovian.
+2. Syndrome-readout errors.  A ``SyndromeProcess`` gives the probability of the
+   length-m syndrome-error label ``e_t`` at time ``t``, possibly conditioned on
+   the previous ``memory`` labels:
+       prob(e_t, history) -> float,
+       history = (e_{t-1}, e_{t-2}, ..., e_{t-memory})   # most-recent first
+   ``memory == 0`` is memoryless (i.i.d.) syndrome noise -> Markovian channel;
+   ``memory >= 1`` carries temporal correlation -> non-Markovian channel.  All
+   parameters are baked in at construction, so ``prob`` takes no noise argument.
+
+The single ``SyndromeProcess`` abstraction replaces the former trio of
+``syndrome_dist`` / ``syndrome_kernel`` / ``syndrome_kernel2`` slots.
 """
 
-from typing import Callable, Sequence, TYPE_CHECKING
+from typing import Callable, Sequence, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:                       # avoid a runtime import cycle
     from ClassicalCode import ClassicalCode
 
-ErrorModel        = Callable[[Sequence[int], float], float]
-SyndromeDistFn    = Callable[[float], dict[tuple[int, ...], float]]
-SyndromeKernelFn  = Callable[[tuple[int, ...], tuple[int, ...]], float]
-SyndromeKernel2Fn = Callable[[tuple[int, ...], tuple[int, ...], tuple[int, ...]], float]
+ErrorModel  = Callable[[Sequence[int], float], float]
+Label       = Tuple[int, ...]
+# prob(e_t, history) -> float,  history = tuple of previous labels (most-recent first)
+SyndromeProbFn = Callable[[Label, Tuple[Label, ...]], float]
 
 
 
@@ -119,153 +125,121 @@ def burst_error_model(e: Sequence[int], p: float) -> float:
 
 
 # ------------------------------------------------------------------
-# Syndrome-label distribution factories  (applied to the m-bit syndrome label)
+# Syndrome-readout error process  (applied to the m-bit syndrome label)
+#
+# One abstraction for every syndrome-noise model, memoryless or correlated.
+# Build one with a factory below and pass it to LogicalChannel(syndrome=...).
 # ------------------------------------------------------------------
 
-def make_iid_syndrome_dist(code: 'ClassicalCode') -> SyndromeDistFn:
+class SyndromeProcess:
     """
-    Factory: i.i.d. bit-flip syndrome distribution bound to *code*.
-    Each of the m syndrome bits is independently flipped with probability p.
+    Probability model for the syndrome-readout error label at each time step.
 
-    Parameters
+    A syndrome-error label ``e`` (a length-``code.m`` tuple in {0, 1}^m) is drawn
+    each step from a distribution that may condition on the previous ``memory``
+    labels:
+
+        prob(e_t, history) -> float,
+        history = (e_{t-1}, e_{t-2}, ..., e_{t-memory})   # most-recent first;
+                                                          # zero label padded for t <= memory
+
+    ``memory == 0`` is memoryless i.i.d. syndrome noise (Markovian logical
+    channel).  ``memory >= 1`` conditions on the recent past and generally makes
+    the logical channel non-Markovian.  All parameters (rates, etc.) are baked in
+    at construction, so ``prob`` needs no noise argument.
+
+    Attributes
     ----------
-    code : ClassicalCode
-
-    Returns
-    -------
-    SyndromeDistFn -- callable  f(p: float) -> dict[tuple[int,...], float]
+    code   : ClassicalCode
+    memory : int              -- number of previous labels ``prob`` conditions on
     """
-    def dist(p: float) -> dict[tuple[int, ...], float]:
-        return {e: iid_bitflip_error(e, p) for e in code.S}
-    dist.__name__ = 'iid_bitflip_syndrome'
-    return dist
+
+    def __init__(self, code: 'ClassicalCode', prob_fn: SyndromeProbFn,
+                 memory: int = 0, name: str = 'syndrome_process') -> None:
+        self.code:    'ClassicalCode' = code
+        self.memory:  int             = int(memory)
+        self._prob:   SyndromeProbFn  = prob_fn
+        self.__name__:  str           = name
+
+    def prob(self, e_t: Label, history: Tuple[Label, ...]) -> float:
+        """Probability of label ``e_t`` given ``history`` (the last ``memory`` labels)."""
+        return self._prob(e_t, history)
+
+    def __repr__(self) -> str:
+        return f"SyndromeProcess(name={self.__name__!r}, memory={self.memory})"
 
 
-def make_perfect_syndrome_dist(code: 'ClassicalCode') -> SyndromeDistFn:
-    """
-    Factory: noiseless syndrome distribution bound to *code*.
-    All weight is on the zero syndrome -- syndrome is always measured correctly.
+# -- Memoryless syndrome processes (memory = 0) --------------------------------
 
-    Parameters
-    ----------
-    code : ClassicalCode
+def iid_syndrome(code: 'ClassicalCode', p: float) -> SyndromeProcess:
+    """i.i.d. bit-flip syndrome noise: each of the m syndrome bits flips with prob p."""
+    table = {e: iid_bitflip_error(e, p) for e in code.S}
+    return SyndromeProcess(code, lambda e_t, history: table[e_t],
+                           memory=0, name='iid_syndrome')
 
-    Returns
-    -------
-    SyndromeDistFn -- callable  f(p: float) -> dict[tuple[int,...], float]
-    """
+
+def perfect_syndrome(code: 'ClassicalCode') -> SyndromeProcess:
+    """Noiseless syndrome readout: all weight on the zero label (always correct)."""
     zero = tuple(0 for _ in range(code.m))
-    def dist(p: float) -> dict[tuple[int, ...], float]:
-        return {e: (1.0 if e == zero else 0.0) for e in code.S}
-    dist.__name__ = 'perfect_syndrome'
-    return dist
+    return SyndromeProcess(code, lambda e_t, history: 1.0 if e_t == zero else 0.0,
+                           memory=0, name='perfect_syndrome')
 
 
-def make_single_flip_syndrome_dist(code: 'ClassicalCode') -> SyndromeDistFn:
+def single_flip_syndrome(code: 'ClassicalCode', p: float) -> SyndromeProcess:
+    """At-most-one syndrome flip: prob (1-p) no flip, p/m per single flip, 0 for weight >= 2."""
+    m = code.m
+    table = {e: ((1.0 - p) if sum(e) == 0 else (p / m if sum(e) == 1 else 0.0))
+             for e in code.S}
+    return SyndromeProcess(code, lambda e_t, history: table[e_t],
+                           memory=0, name='single_flip_syndrome')
+
+
+# -- Temporally correlated syndrome processes (memory >= 1) --------------------
+
+def sticky_syndrome(code: 'ClassicalCode', q: float, p: float) -> SyndromeProcess:
     """
-    Factory: at-most-one-flip syndrome distribution bound to *code*.
-    Prob (1-p) for no flip, p/m per single-bit syndrome error, 0 for weight >= 2.
+    Sticky (memory-1) syndrome noise: e_t repeats the previous label e_{t-1} with
+    probability q, else is freshly drawn i.i.d. bit-flip(p):
 
-    Parameters
-    ----------
-    code : ClassicalCode
+        prob(e_t | e_{t-1}) = q * [e_t == e_{t-1}] + (1 - q) * iid_bitflip(e_t, p)
 
-    Returns
-    -------
-    SyndromeDistFn -- callable  f(p: float) -> dict[tuple[int,...], float]
+    The repeat term correlates consecutive labels, making the logical channel
+    non-Markovian.  Each column (fixed e_{t-1}) is a normalised distribution.
+    Was ``make_non_markovian_syndrome_kernel``.
     """
-    def dist(p: float) -> dict[tuple[int, ...], float]:
-        result: dict[tuple[int, ...], float] = {}
-        for e in code.S:
-            w = int(sum(e))
-            if w == 0:
-                result[e] = 1.0 - p
-            elif w == 1:
-                result[e] = p / code.m
-            else:
-                result[e] = 0.0
-        return result
-    dist.__name__ = 'single_flip_syndrome'
-    return dist
+    table = {e: iid_bitflip_error(e, p) for e in code.S}
+
+    def prob(e_t: Label, history: Tuple[Label, ...]) -> float:
+        e_tm1 = history[0]
+        same  = 1.0 if e_t == e_tm1 else 0.0
+        return q * same + (1.0 - q) * table[e_t]
+
+    return SyndromeProcess(code, prob, memory=1, name='sticky_syndrome')
 
 
-# ------------------------------------------------------------------
-# Syndrome-label transition kernels  (temporally correlated => non-Markovian)
-# ------------------------------------------------------------------
-
-def make_non_markovian_syndrome_kernel(code: 'ClassicalCode',
-                                       q: float, p: float) -> SyndromeKernelFn:
+def exp_syndrome_1(code: 'ClassicalCode', q: float, p: float) -> SyndromeProcess:
     """
-    Factory: non-Markovian (temporally correlated) syndrome-error kernel.
-
-    At each step the syndrome error e_t repeats the previous one e_{t-1} with
-    probability q; otherwise (prob 1 - q) it is freshly drawn from the i.i.d.
-    bit-flip distribution with parameter p:
-
-        K(e_t | e_{t-1}) = q * [e_t == e_{t-1}] + (1 - q) * iid_bitflip(e_t, p)
-
-    For each fixed e_{t-1} this is a valid distribution over code.S (the
-    iid_bitflip masses sum to 1 and the delta term contributes q), so columns
-    are normalised.  The repeat term q correlates consecutive labels in time,
-    which is what renders the induced logical channel non-Markovian.
-
-    Parameters
-    ----------
-    code : ClassicalCode
-    q    : float -- probability of repeating the previous syndrome error
-    p    : float -- bit-flip parameter of the fresh-draw distribution
-
-    Returns
-    -------
-    SyndromeKernelFn -- callable  K(e_t, e_{t-1}) -> float
-    """
-    iid = {e: iid_bitflip_error(e, p) for e in code.S}
-
-    def kernel(e_t: tuple[int, ...], e_tm1: tuple[int, ...]) -> float:
-        same = 1.0 if e_t == e_tm1 else 0.0
-        return q * same + (1.0 - q) * iid[e_t]
-    kernel.__name__ = 'non_markovian_syndrome'
-    return kernel
-
-
-def make_exp_error_model_1(code: 'ClassicalCode',
-                           q: float, p: float) -> SyndromeKernel2Fn:
-    """
-    Factory: experimental two-step-history syndrome kernel (arbitrary, for probing
-    non-Markovian behaviour).
-
-    For t >= 2 the transition depends on the two previous syndrome errors.  If
-    their mod-2 sum (XOR) is the all-ones string, the next error is forced toward
-    all-ones; otherwise it is i.i.d. bit-flip(p):
+    Experimental two-step-history (memory-2) syndrome process, for probing
+    non-Markovian behaviour.  If the XOR of the two previous labels is all-ones,
+    the next label is forced toward all-ones; otherwise it is i.i.d. bit-flip(p):
 
         if (e_{t-1} XOR e_{t-2}) == 11...1:
-            K(e_t | e_{t-1}, e_{t-2}) = q * [e_t == 11...1] + (1 - q) * iid_bitflip(e_t, p)
+            prob(e_t | ...) = q * [e_t == 11...1] + (1 - q) * iid_bitflip(e_t, p)
         else:
-            K(e_t | e_{t-1}, e_{t-2}) = iid_bitflip(e_t, p)
+            prob(e_t | ...) = iid_bitflip(e_t, p)
 
-    Each branch is normalised over e_t (the iid masses sum to 1 and the delta term
-    contributes q).  With q = 1 the all-ones history pins e_t to all-ones.
-
-    Parameters
-    ----------
-    code : ClassicalCode
-    q    : float -- probability of forcing all-ones when the history condition fires
-    p    : float -- bit-flip parameter of the i.i.d. fallback distribution
-
-    Returns
-    -------
-    SyndromeKernel2Fn -- callable  K(e_t, e_{t-1}, e_{t-2}) -> float
+    With q = 1 the all-ones history pins e_t to all-ones.  Was
+    ``make_exp_error_model_1``.
     """
     allones = tuple(1 for _ in range(code.m))
-    iid     = {e: iid_bitflip_error(e, p) for e in code.S}
+    table   = {e: iid_bitflip_error(e, p) for e in code.S}
 
-    def kernel2(e_t: tuple[int, ...],
-                e_tm1: tuple[int, ...],
-                e_tm2: tuple[int, ...]) -> float:
+    def prob(e_t: Label, history: Tuple[Label, ...]) -> float:
+        e_tm1, e_tm2 = history[0], history[1]
         xor = tuple(a ^ b for a, b in zip(e_tm1, e_tm2))
         if xor == allones:
             same = 1.0 if e_t == allones else 0.0
-            return q * same + (1.0 - q) * iid[e_t]
-        return iid[e_t]
-    kernel2.__name__ = 'exp_error_model_1'
-    return kernel2
+            return q * same + (1.0 - q) * table[e_t]
+        return table[e_t]
+
+    return SyndromeProcess(code, prob, memory=2, name='exp_syndrome_1')
