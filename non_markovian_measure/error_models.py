@@ -57,7 +57,7 @@ def iid_bitflip_error(e: Sequence[int], p: float) -> float:
     return p ** w * (1 - p) ** (n - w)
 
 
-def perfect_physical_error(e: Sequence[int], p: float) -> float:
+def perfect_physical_error(e: Sequence[int], p : float) -> float:
     """
     Noiseless physical channel: probability 1 on the all-zeros pattern, 0 else.
 
@@ -67,7 +67,6 @@ def perfect_physical_error(e: Sequence[int], p: float) -> float:
     ----------
     e : Sequence[int] -- binary error pattern
     p : float         -- ignored
-
     Returns
     -------
     float -- 1.0 if e is all zeros, else 0.0
