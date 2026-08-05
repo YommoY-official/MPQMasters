@@ -201,6 +201,11 @@ def logical_basis_state(code: ClassicalCode, l: int) -> np.ndarray:
     return rho
 
 
+def input_state(code: ClassicalCode, p: float) -> np.ndarray:
+    """Logical codeword mixture (1-p)|0>_L<0| + p|1>_L<1|, shape (2^k, 2^k)."""
+    return (1 - p) * logical_basis_state(code, 0) + p * logical_basis_state(code, 1)
+
+
 def max_blp_measure(code: ClassicalCode, channel: Channel, T: int) -> tuple[float, tuple[int, int]]:
     """
     Maximum BLP measure over all pairs of logical basis states, using a prebuilt channel.
